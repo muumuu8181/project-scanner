@@ -53,6 +53,52 @@ python scanner.py /path/to/project --concat --concat-ext .py .js
 - Python 3.8+
 - No external dependencies (uses only standard library)
 
+---
+
+## Development Rules (AI Handoff Protocol)
+
+This project uses AI-assisted development. The following rules ensure seamless handoff between sessions.
+
+### Version Management
+- **Increment version by 0.01** for each update (e.g., 0.1 → 0.11 → 0.12)
+- Version is defined in `scanner.py` as `__version__`
+- Version is displayed in HTML report (top-right corner)
+
+### Handoff Documentation
+Always maintain documentation so **anyone can continue development at any time**:
+
+1. **Obsidian Dev Log**: `20260105_project_scanner_devlog.md`
+   - Location: `C:\Users\user\Desktop\work\60_obsidian\test_sync\`
+   - Contains: User requirements (verbatim), technical decisions, work log with timestamps
+
+2. **Current Status** (update after each change):
+   - Latest version: Check `__version__` in scanner.py
+   - Last update: Check git log
+   - Pending tasks: See "Future Work" section below
+
+### Before Ending a Session
+- Commit all changes to git
+- Push to GitHub
+- Update Obsidian dev log with:
+  - What was done (with timestamp)
+  - Current state
+  - Next steps if any
+
+### Technical Decisions Log
+| Decision | Reason | Date |
+|----------|--------|------|
+| Not using Sphinx | Too heavy for this use case; requires conf.py, module import structure. AST is simpler for static analysis. | 2026-01-05 |
+| Python AST for function extraction | No import needed, lightweight, works on any .py file | 2026-01-05 |
+
+---
+
+## Future Work
+
+- [ ] JavaScript/TypeScript function extraction
+- [ ] Markdown output format
+- [ ] Config file support
+- [ ] Exclude patterns customization
+
 ## License
 
 MIT
