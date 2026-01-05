@@ -11,7 +11,7 @@ Project Scanner - プロジェクト構造分析ツール
 - HTMLレポート出力
 """
 
-__version__ = "0.11"
+__version__ = "0.12"
 
 import os
 import ast
