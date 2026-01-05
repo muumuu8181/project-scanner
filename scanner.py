@@ -11,10 +11,12 @@ Project Scanner - プロジェクト構造分析ツール
 - HTMLレポート出力
 """
 
-__version__ = "0.13"
+__version__ = "0.14"
 
 import os
+import sys
 import ast
+import hashlib
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -31,10 +33,20 @@ class FileInfo:
     extension: str
     line_count: int
     size: int  # bytes
+    mtime: float = 0.0  # 更新日時（タイムスタンプ）
+    file_hash: str = ""  # ファイルハッシュ（MD5）
     first_lines: List[str] = field(default_factory=list)
     last_lines: List[str] = field(default_factory=list)
     functions: List[str] = field(default_factory=list)
     classes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Warning:
+    """警告情報"""
+    type: str  # "empty", "same_size", "same_mtime", "duplicate_hash"
+    message: str
+    files: List[str]
 
 
 @dataclass
@@ -49,6 +61,95 @@ class ScanResult:
     files: List[FileInfo]
     all_functions: List[Tuple[str, str]]  # [(file, func_name), ...]
     all_classes: List[Tuple[str, str]]  # [(file, class_name), ...]
+    warnings: List[Warning] = field(default_factory=list)  # ダミー検出警告
+
+
+class DuplicateDetector:
+    """ダミー・重複ファイル検出"""
+
+    # 空ファイルとみなすサイズ閾値
+    EMPTY_THRESHOLD = 10  # bytes
+
+    def detect(self, files: List[FileInfo]) -> List[Warning]:
+        """全ての検出を実行"""
+        warnings = []
+        warnings.extend(self._detect_empty_files(files))
+        warnings.extend(self._detect_same_size(files))
+        warnings.extend(self._detect_same_mtime(files))
+        warnings.extend(self._detect_duplicate_hash(files))
+        return warnings
+
+    def _detect_empty_files(self, files: List[FileInfo]) -> List[Warning]:
+        """空ファイル検出"""
+        empty_files = [f.relative_path for f in files if f.size <= self.EMPTY_THRESHOLD]
+        if empty_files:
+            return [Warning(
+                type="empty",
+                message=f"空または極小ファイルが{len(empty_files)}件見つかりました（{self.EMPTY_THRESHOLD}bytes以下）",
+                files=empty_files
+            )]
+        return []
+
+    def _detect_same_size(self, files: List[FileInfo]) -> List[Warning]:
+        """同一サイズファイル検出（バイナリ除外、10件以上で警告）"""
+        warnings = []
+        size_groups: Dict[int, List[str]] = defaultdict(list)
+
+        for f in files:
+            # 0バイトと極小ファイルは除外（別途検出）
+            if f.size > self.EMPTY_THRESHOLD:
+                size_groups[f.size].append(f.relative_path)
+
+        for size, file_list in size_groups.items():
+            if len(file_list) >= 3:  # 3件以上で警告
+                warnings.append(Warning(
+                    type="same_size",
+                    message=f"同一サイズ（{size:,}bytes）のファイルが{len(file_list)}件あります",
+                    files=file_list
+                ))
+
+        return warnings
+
+    def _detect_same_mtime(self, files: List[FileInfo]) -> List[Warning]:
+        """同一タイムスタンプ検出（秒単位で一致）"""
+        warnings = []
+        mtime_groups: Dict[int, List[str]] = defaultdict(list)
+
+        for f in files:
+            if f.mtime > 0:
+                # 秒単位に丸める
+                mtime_sec = int(f.mtime)
+                mtime_groups[mtime_sec].append(f.relative_path)
+
+        for mtime, file_list in mtime_groups.items():
+            if len(file_list) >= 5:  # 5件以上で警告
+                dt = datetime.fromtimestamp(mtime)
+                warnings.append(Warning(
+                    type="same_mtime",
+                    message=f"同一時刻（{dt.strftime('%Y-%m-%d %H:%M:%S')}）に作成されたファイルが{len(file_list)}件あります",
+                    files=file_list
+                ))
+
+        return warnings
+
+    def _detect_duplicate_hash(self, files: List[FileInfo]) -> List[Warning]:
+        """ハッシュ重複検出（完全に同一の内容）"""
+        warnings = []
+        hash_groups: Dict[str, List[str]] = defaultdict(list)
+
+        for f in files:
+            if f.file_hash:
+                hash_groups[f.file_hash].append(f.relative_path)
+
+        for file_hash, file_list in hash_groups.items():
+            if len(file_list) >= 2:  # 2件以上で警告
+                warnings.append(Warning(
+                    type="duplicate_hash",
+                    message=f"内容が完全に同一のファイルが{len(file_list)}件あります",
+                    files=file_list
+                ))
+
+        return warnings
 
 
 class ProjectScanner:
@@ -126,6 +227,10 @@ class ProjectScanner:
                 for cls in file_info.classes:
                     all_classes.append((str(relative_path), cls))
 
+        # ダミー検出
+        detector = DuplicateDetector()
+        warnings = detector.detect(files)
+
         return ScanResult(
             root_path=root,
             scan_time=datetime.now(),
@@ -136,12 +241,20 @@ class ProjectScanner:
                                         key=lambda x: x[1], reverse=True)),
             files=files,
             all_functions=all_functions,
-            all_classes=all_classes
+            all_classes=all_classes,
+            warnings=warnings
         )
 
     def _analyze_file(self, path: Path, relative_path: str, extension: str) -> FileInfo:
         """ファイルを分析"""
-        size = path.stat().st_size
+        stat = path.stat()
+        size = stat.st_size
+        mtime = stat.st_mtime
+
+        # ファイルハッシュ計算（小さいファイルのみ、大きいファイルはスキップ）
+        file_hash = ""
+        if size > 0 and size < 10 * 1024 * 1024:  # 10MB未満
+            file_hash = self._calculate_hash(path)
 
         # バイナリファイルは行数カウントしない
         if extension in self.BINARY_EXTENSIONS:
@@ -150,7 +263,9 @@ class ProjectScanner:
                 relative_path=relative_path,
                 extension=extension,
                 line_count=0,
-                size=size
+                size=size,
+                mtime=mtime,
+                file_hash=file_hash
             )
 
         # テキストファイルの分析
@@ -166,6 +281,8 @@ class ProjectScanner:
                 extension=extension,
                 line_count=len(lines),
                 size=size,
+                mtime=mtime,
+                file_hash=file_hash,
                 first_lines=first_lines,
                 last_lines=last_lines,
                 functions=functions,
@@ -178,8 +295,21 @@ class ProjectScanner:
                 relative_path=relative_path,
                 extension=extension,
                 line_count=0,
-                size=size
+                size=size,
+                mtime=mtime,
+                file_hash=file_hash
             )
+
+    def _calculate_hash(self, path: Path) -> str:
+        """ファイルのMD5ハッシュを計算"""
+        try:
+            hasher = hashlib.md5()
+            with open(path, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except:
+            return ""
 
     def _read_lines(self, path: Path) -> List[str]:
         """ファイルの全行を読み取り"""
@@ -286,6 +416,28 @@ class HTMLReportGenerator:
         for file_path, class_name in result.all_classes:
             class_rows += f"<tr><td>{file_path}</td><td>{class_name}</td></tr>\n"
 
+        # 警告セクション生成
+        warning_html = ""
+        if result.warnings:
+            warning_items = ""
+            for w in result.warnings:
+                icon = {"empty": "📭", "same_size": "📏", "same_mtime": "⏰", "duplicate_hash": "👯"}.get(w.type, "⚠️")
+                files_list = "<br>".join(f"・{f}" for f in w.files[:10])
+                if len(w.files) > 10:
+                    files_list += f"<br>...他{len(w.files) - 10}件"
+                warning_items += f"""
+                <div class="warning-item">
+                    <div class="warning-header">{icon} {w.message}</div>
+                    <div class="warning-files">{files_list}</div>
+                </div>
+                """
+            warning_html = f"""
+            <h2>⚠️ 警告（ダミー検出）</h2>
+            <div class="warning-section">
+                {warning_items}
+            </div>
+            """
+
         return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -349,6 +501,30 @@ class HTMLReportGenerator:
             font-size: 0.85em;
             color: #888;
         }}
+        .warning-section {{
+            background: #3d1f1f;
+            border: 2px solid #ff6b6b;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }}
+        .warning-item {{
+            background: #2d1515;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }}
+        .warning-header {{
+            font-size: 1.1em;
+            font-weight: bold;
+            color: #ff6b6b;
+            margin-bottom: 10px;
+        }}
+        .warning-files {{
+            color: #ffaaaa;
+            font-size: 0.9em;
+            padding-left: 20px;
+        }}
     </style>
 </head>
 <body>
@@ -363,6 +539,8 @@ class HTMLReportGenerator:
         対象: {result.root_path}<br>
         スキャン日時: {result.scan_time.strftime('%Y-%m-%d %H:%M:%S')}
     </p>
+
+    {warning_html}
 
     <h2>サマリー</h2>
     <div class="summary">
@@ -585,6 +763,16 @@ class FileConcatenator:
         return outputs
 
 
+def safe_print(text: str):
+    """エンコーディングエラーを回避してprint"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # エンコードできない文字を?に置換
+        encoded = text.encode(sys.stdout.encoding, errors='replace')
+        print(encoded.decode(sys.stdout.encoding))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Project Scanner - プロジェクト構造分析ツール'
@@ -610,6 +798,17 @@ def main():
     print(f"拡張子の種類: {len(result.extension_stats)}")
     print(f"関数数: {len(result.all_functions)}")
     print(f"クラス数: {len(result.all_classes)}")
+    print(f"警告数: {len(result.warnings)}")
+
+    # 警告があれば表示
+    if result.warnings:
+        safe_print(f"\n=== [!] 警告（ダミー検出） ===")
+        for w in result.warnings:
+            safe_print(f"[{w.type}] {w.message}")
+            for f in w.files[:5]:
+                safe_print(f"  - {f}")
+            if len(w.files) > 5:
+                safe_print(f"  ... 他{len(w.files) - 5}件")
 
     # HTMLレポート生成
     generator = HTMLReportGenerator()
